@@ -42,9 +42,18 @@ fn handle_device(id: i32) -> PortMidiResult<()> {
 
     while quit_watcher.is_running() {
         while let Some(event) = try!(input.read()) {
-            let note = Note {
-                key: event.message.data1,
-                vel: event.message.data2
+            let key = event.message.data1;
+            let velocity = event.message.data2;
+            let note = match event.message.status {
+                144 => if velocity == 0 {
+                    Midi::KeyReleased(key)
+                } else {
+                    Midi::KeyPressed(key, velocity)
+                },
+                176 => Midi::Knob(key, velocity),
+                192 => Midi::Button(key),
+                224 => Midi::PitchBend(velocity),
+                _   => Midi::Unknown(event.message.status, key, velocity)
             };
             let _ = server.send(note);
         }
@@ -57,9 +66,16 @@ fn handle_device(id: i32) -> PortMidiResult<()> {
 }
 
 #[derive(Debug)]
-struct Note { key: u8, vel: u8 }
+enum Midi {
+    KeyPressed(u8, u8),
+    KeyReleased(u8),
+    Knob(u8, u8),
+    Button(u8),
+    PitchBend(u8),
+    Unknown(u8, u8, u8),
+}
 
-fn note_server() -> Sender<Note> {
+fn note_server() -> Sender<Midi> {
     let (send, recv) = channel();
     thread::spawn(move || {
         notes(recv)
@@ -67,11 +83,10 @@ fn note_server() -> Sender<Note> {
     send
 }
 
-fn notes(recv: Receiver<Note>) {
+fn notes(recv: Receiver<Midi>) {
     loop {
-        if let Ok(note) = recv.recv() {
-            println!("{} {}", note.key, note.vel);
-        }
+        let key = recv.recv().unwrap();
+        println!("{:?}", key);
     }
 }
 
