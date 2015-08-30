@@ -1,12 +1,22 @@
 extern crate portmidi as pm;
+extern crate portaudio;
+extern crate num;
+
+use std::f64;
 use std::thread::sleep_ms;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Mutex};
 use std::thread;
 use std::io::stdin;
 use std::sync::mpsc::{Sender, Receiver, channel};
+use std::error::Error;
 
 use pm::PortMidiResult;
 use pm::PortMidiError::InvalidDeviceId;
+use portaudio::pa;
+
+const SAMPLE_RATE: f64 = 44_100.0;
+const FRAMES: usize = 256;
+const DELTATIME: f64 = 1.0 / SAMPLE_RATE;
 
 fn main() {
     if let Some(device_id) = get_device() {
@@ -77,17 +87,80 @@ enum Midi {
 
 fn note_server() -> Sender<Midi> {
     let (send, recv) = channel();
-    thread::spawn(move || {
-        notes(recv)
-    });
+    let note = Arc::new(Mutex::new(0.0));
+    let send_note = note.clone();
+    thread::spawn(move || notes(recv, note));
+    thread::spawn(move || synth(send_note));
     send
 }
 
-fn notes(recv: Receiver<Midi>) {
-    loop {
-        let key = recv.recv().unwrap();
-        println!("{:?}", key);
+fn notes(recv: Receiver<Midi>, notes: Arc<Mutex<f64>>) {
+    fn pitch_from_key(key: u8) -> f64 {
+        1.05946309436f64.powi(key as i32 - 49) * 440.0
     }
+
+    let mut pitches = Vec::new();
+    loop {
+        match recv.recv().unwrap() {
+            Midi::KeyPressed(key, _) => {
+                let pitch = pitch_from_key(key);
+                pitches.push(pitch);
+            }
+            Midi::KeyReleased(key) => {
+                let pitch = pitch_from_key(key);
+                pitches.retain(|&x| x != pitch);
+            }
+            _ => (),
+        };
+        let mut guard = notes.lock().unwrap();
+        *guard = *pitches.last().unwrap_or(&0.0);
+    }
+}
+
+fn synth(note: Arc<Mutex<f64>>) -> Result<(), pa::Error> {
+    try!(pa::initialize());
+    
+    let dev_out = pa::device::get_default_output();
+    let output_info = pa::device::get_info(dev_out).unwrap();
+    let out_params = pa::StreamParameters {
+        device: dev_out,
+        channel_count: 1,
+        sample_format: pa::SampleFormat::Float32,
+        suggested_latency: output_info.default_low_output_latency
+    };
+
+    let mut time: f64 = 0.0;
+    let callback = Box::new(move |
+                            _input: &[f32],
+                            output: &mut[f32],
+                            frames: u32,
+                            _time_info: &pa::StreamCallbackTimeInfo,
+                            _flags: pa::StreamCallbackFlags
+                            | -> pa::StreamCallbackResult {
+                                let pitch = {
+                                    let guard = note.lock().unwrap();
+                                    *guard
+                                };
+
+                                assert!(frames == FRAMES as u32);
+                                for sample in output.iter_mut() {
+                                    time += DELTATIME;
+                                    *sample = 0.0;
+                                    *sample += ((time*pitch*f64::consts::PI*2.0).sin() * 0.1) as f32;
+                                }
+                                pa::StreamCallbackResult::Continue
+                            });
+
+    let mut stream: pa::Stream<f32, f32> = pa::Stream::new();
+    let _ = stream.open(None, Some(&out_params), SAMPLE_RATE,
+                        FRAMES as u32, pa::StreamFlags::empty(),
+                        Some(callback));
+
+    try!(stream.start());
+    while let Ok(true) = stream.is_active() { thread::sleep_ms(100); }
+    try!(stream.close());
+    try!(pa::terminate());
+    Ok(())
 }
 
 struct QuitWatcher(Arc<RwLock<bool>>);
