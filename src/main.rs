@@ -7,7 +7,7 @@ use std::thread::sleep_ms;
 use std::sync::{Arc, RwLock, Mutex};
 use std::thread;
 use std::io::stdin;
-use std::sync::mpsc::{Sender, Receiver, channel};
+use std::sync::mpsc::{Sender, Receiver, channel, RecvError};
 use std::error::Error;
 
 use pm::PortMidiResult;
@@ -94,13 +94,13 @@ fn note_server() -> Sender<Midi> {
     send
 }
 
-fn notes(recv: Receiver<Midi>, notes: Arc<Mutex<Vec<(f64, f64, bool)>>>) {
+fn notes(recv: Receiver<Midi>, notes: Arc<Mutex<Vec<(f64, f64, bool)>>>) -> Result<(), RecvError> {
     fn pitch_from_key(key: u8) -> f64 {
         1.05946309436f64.powi(key as i32 - 49) * 440.0
     }
 
     loop {
-        match recv.recv().unwrap() {
+        match try!(recv.recv()) {
             Midi::KeyPressed(key, _) => {
                 let mut guard = notes.lock().unwrap();
                 let pitch = pitch_from_key(key);
@@ -112,7 +112,6 @@ fn notes(recv: Receiver<Midi>, notes: Arc<Mutex<Vec<(f64, f64, bool)>>>) {
                 *guard = guard.iter()
                     .map(|&(p, t, status)| (p, t, status && p != pitch))
                     .collect();
-                println!("{:?}", *guard);
             }
             _ => (),
         };
@@ -131,6 +130,7 @@ fn synth(note: Arc<Mutex<Vec<(f64, f64, bool)>>>) -> Result<(), pa::Error> {
         suggested_latency: output_info.default_low_output_latency
     };
 
+    const PI_2: f64 = 2.0 * f64::consts::PI;
     let callback = Box::new(move |
                             _input: &[f32],
                             output: &mut[f32],
@@ -142,12 +142,17 @@ fn synth(note: Arc<Mutex<Vec<(f64, f64, bool)>>>) -> Result<(), pa::Error> {
                                 let mut guard = note.lock().unwrap();
                                 let window_delta = 1.0 / FRAMES as f32;
                                 let mut x = 1.0;
+                                let volume = 0.1;
+                                let size = 0.5;
+                                let ratio = 0.5;
                                 for sample in output.iter_mut() {
                                     *sample = 0.0;
                                     for &mut (pitch, ref mut time, alive) in guard.iter_mut() {
-                                        *time += DELTATIME*pitch;
-                                        let delta = ((*time*f64::consts::PI*2.0).sin() * 0.1) as f32;
+                                        let t = *time;
+                                        let pitch_prime = (1.0 + (ratio * t * PI_2).sin()*size) * pitch;
+                                        let delta = ((t * PI_2).sin() * volume) as f32;
                                         *sample += if alive { delta } else { delta * x };
+                                        *time += DELTATIME * pitch_prime;
                                     }
                                     x -= window_delta;
                                 }
