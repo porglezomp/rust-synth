@@ -87,14 +87,31 @@ enum Midi {
 
 fn note_server() -> Sender<Midi> {
     let (send, recv) = channel();
+    let p = Params {
+        volume: 0.1,
+        ratio: 0.5,
+        size: 0.5,
+    };
+    let params = Arc::new(Mutex::new(p));
     let note = Arc::new(Mutex::new(Vec::new()));
     let send_note = note.clone();
-    thread::spawn(move || notes(recv, note));
-    thread::spawn(move || synth(send_note));
+    let params1 = params.clone();
+    thread::spawn(move || notes(recv, note, params));
+    thread::spawn(move || synth(send_note, params1));
     send
 }
 
-fn notes(recv: Receiver<Midi>, notes: Arc<Mutex<Vec<(f64, f64, bool)>>>) -> Result<(), RecvError> {
+#[derive(Clone)]
+struct Params {
+    volume: f64,
+    ratio: f64,
+    size: f64,
+}
+
+fn notes(recv: Receiver<Midi>,
+         notes: Arc<Mutex<Vec<(f64, f64, bool)>>>,
+         params: Arc<Mutex<Params>>)
+         -> Result<(), RecvError> {
     fn pitch_from_key(key: u8) -> f64 {
         1.05946309436f64.powi(key as i32 - 49) * 440.0
     }
@@ -113,12 +130,21 @@ fn notes(recv: Receiver<Midi>, notes: Arc<Mutex<Vec<(f64, f64, bool)>>>) -> Resu
                     .map(|&(p, t, status)| (p, t, status && p != pitch))
                     .collect();
             }
-            _ => (),
+            Midi::Knob(id, value) => {
+                let mut guard = params.lock().unwrap();
+                match id {
+                    7 => guard.volume = value as f64 / 127.0,
+                    73 => guard.size = value as f64 / 127.0,
+                    72 => guard.ratio = value as f64 / 127.0,
+                    id => println!("knob #{}", id),
+                }
+            }
+            x => println!("{:?}", x),
         };
     }
 }
 
-fn synth(note: Arc<Mutex<Vec<(f64, f64, bool)>>>) -> Result<(), pa::Error> {
+fn synth(note: Arc<Mutex<Vec<(f64, f64, bool)>>>, params: Arc<Mutex<Params>>) -> Result<(), pa::Error> {
     try!(pa::initialize());
     
     let dev_out = pa::device::get_default_output();
@@ -140,21 +166,19 @@ fn synth(note: Arc<Mutex<Vec<(f64, f64, bool)>>>) -> Result<(), pa::Error> {
                             | -> pa::StreamCallbackResult {
                                 assert!(frames == FRAMES as u32);
                                 let mut guard = note.lock().unwrap();
+                                let params = { params.lock().unwrap().clone() };
                                 let window_delta = 1.0 / FRAMES as f32;
-                                let mut x = 1.0;
-                                let volume = 0.1;
-                                let size = 0.5;
-                                let ratio = 0.5;
+                                let mut fade = 1.0;
                                 for sample in output.iter_mut() {
                                     *sample = 0.0;
                                     for &mut (pitch, ref mut time, alive) in guard.iter_mut() {
                                         let t = *time;
-                                        let pitch_prime = (1.0 + (ratio * t * PI_2).sin()*size) * pitch;
-                                        let delta = ((t * PI_2).sin() * volume) as f32;
-                                        *sample += if alive { delta } else { delta * x };
+                                        let pitch_prime = (1.0 + (params.ratio * t * PI_2).sin()*params.size) * pitch;
+                                        let delta = ((t * PI_2).sin() * params.volume) as f32;
+                                        *sample += if alive { delta } else { delta * fade };
                                         *time += DELTATIME * pitch_prime;
                                     }
-                                    x -= window_delta;
+                                    fade -= window_delta;
                                 }
                                 guard.retain(|&(_, _, keep)| keep);
                                 pa::StreamCallbackResult::Continue
