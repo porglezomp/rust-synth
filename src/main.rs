@@ -94,7 +94,7 @@ fn note_server() -> Sender<Midi> {
     send
 }
 
-fn notes(recv: Receiver<Midi>, notes: Arc<Mutex<Vec<(f64, f64)>>>) {
+fn notes(recv: Receiver<Midi>, notes: Arc<Mutex<Vec<(f64, f64, bool)>>>) {
     fn pitch_from_key(key: u8) -> f64 {
         1.05946309436f64.powi(key as i32 - 49) * 440.0
     }
@@ -104,19 +104,22 @@ fn notes(recv: Receiver<Midi>, notes: Arc<Mutex<Vec<(f64, f64)>>>) {
             Midi::KeyPressed(key, _) => {
                 let mut guard = notes.lock().unwrap();
                 let pitch = pitch_from_key(key);
-                guard.push((pitch, 0.0));
+                guard.push((pitch, 0.0, true));
             }
             Midi::KeyReleased(key) => {
                 let mut guard = notes.lock().unwrap();
                 let pitch = pitch_from_key(key);
-                guard.retain(|&(x, _)| x != pitch);
+                *guard = guard.iter()
+                    .map(|&(p, t, status)| (p, t, status && p != pitch))
+                    .collect();
+                println!("{:?}", *guard);
             }
             _ => (),
         };
     }
 }
 
-fn synth(note: Arc<Mutex<Vec<(f64, f64)>>>) -> Result<(), pa::Error> {
+fn synth(note: Arc<Mutex<Vec<(f64, f64, bool)>>>) -> Result<(), pa::Error> {
     try!(pa::initialize());
     
     let dev_out = pa::device::get_default_output();
@@ -136,14 +139,19 @@ fn synth(note: Arc<Mutex<Vec<(f64, f64)>>>) -> Result<(), pa::Error> {
                             _flags: pa::StreamCallbackFlags
                             | -> pa::StreamCallbackResult {
                                 assert!(frames == FRAMES as u32);
-                                let mut guard = note.lock().unwrap();                                
+                                let mut guard = note.lock().unwrap();
+                                let window_delta = 1.0 / FRAMES as f32;
+                                let mut x = 1.0;
                                 for sample in output.iter_mut() {
                                     *sample = 0.0;
-                                    for &mut (pitch, ref mut time) in guard.iter_mut() {
+                                    for &mut (pitch, ref mut time, alive) in guard.iter_mut() {
                                         *time += DELTATIME*pitch;
-                                        *sample += ((*time*f64::consts::PI*2.0).sin() * 0.1) as f32;
+                                        let delta = ((*time*f64::consts::PI*2.0).sin() * 0.1) as f32;
+                                        *sample += if alive { delta } else { delta * x };
                                     }
+                                    x -= window_delta;
                                 }
+                                guard.retain(|&(_, _, keep)| keep);
                                 pa::StreamCallbackResult::Continue
                             });
 
