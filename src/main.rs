@@ -87,37 +87,36 @@ enum Midi {
 
 fn note_server() -> Sender<Midi> {
     let (send, recv) = channel();
-    let note = Arc::new(Mutex::new(0.0));
+    let note = Arc::new(Mutex::new(Vec::new()));
     let send_note = note.clone();
     thread::spawn(move || notes(recv, note));
     thread::spawn(move || synth(send_note));
     send
 }
 
-fn notes(recv: Receiver<Midi>, notes: Arc<Mutex<f64>>) {
+fn notes(recv: Receiver<Midi>, notes: Arc<Mutex<Vec<(f64, f64)>>>) {
     fn pitch_from_key(key: u8) -> f64 {
         1.05946309436f64.powi(key as i32 - 49) * 440.0
     }
 
-    let mut pitches = Vec::new();
     loop {
         match recv.recv().unwrap() {
             Midi::KeyPressed(key, _) => {
+                let mut guard = notes.lock().unwrap();
                 let pitch = pitch_from_key(key);
-                pitches.push(pitch);
+                guard.push((pitch, 0.0));
             }
             Midi::KeyReleased(key) => {
+                let mut guard = notes.lock().unwrap();
                 let pitch = pitch_from_key(key);
-                pitches.retain(|&x| x != pitch);
+                guard.retain(|&(x, _)| x != pitch);
             }
             _ => (),
         };
-        let mut guard = notes.lock().unwrap();
-        *guard = *pitches.last().unwrap_or(&0.0);
     }
 }
 
-fn synth(note: Arc<Mutex<f64>>) -> Result<(), pa::Error> {
+fn synth(note: Arc<Mutex<Vec<(f64, f64)>>>) -> Result<(), pa::Error> {
     try!(pa::initialize());
     
     let dev_out = pa::device::get_default_output();
@@ -129,7 +128,6 @@ fn synth(note: Arc<Mutex<f64>>) -> Result<(), pa::Error> {
         suggested_latency: output_info.default_low_output_latency
     };
 
-    let mut time: f64 = 0.0;
     let callback = Box::new(move |
                             _input: &[f32],
                             output: &mut[f32],
@@ -137,16 +135,14 @@ fn synth(note: Arc<Mutex<f64>>) -> Result<(), pa::Error> {
                             _time_info: &pa::StreamCallbackTimeInfo,
                             _flags: pa::StreamCallbackFlags
                             | -> pa::StreamCallbackResult {
-                                let pitch = {
-                                    let guard = note.lock().unwrap();
-                                    *guard
-                                };
-
                                 assert!(frames == FRAMES as u32);
+                                let mut guard = note.lock().unwrap();                                
                                 for sample in output.iter_mut() {
-                                    time += DELTATIME;
                                     *sample = 0.0;
-                                    *sample += ((time*pitch*f64::consts::PI*2.0).sin() * 0.1) as f32;
+                                    for &mut (pitch, ref mut time) in guard.iter_mut() {
+                                        *time += DELTATIME*pitch;
+                                        *sample += ((*time*f64::consts::PI*2.0).sin() * 0.1) as f32;
+                                    }
                                 }
                                 pa::StreamCallbackResult::Continue
                             });
